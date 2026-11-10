@@ -1,8 +1,0 @@
-.git
-.Rhistory
-.RData
-.Rproj.user
-*.Rproj
-examples/
-*.csv
-!survey.csv
