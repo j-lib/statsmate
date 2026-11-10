@@ -39,7 +39,7 @@ RUN R -e "library(plumber); library(broom); library(jsonlite); cat('✅ All pack
 WORKDIR /app
 
 # Copy R scripts
-COPY plumber.R .
+COPY plumber_reserved.R .
 COPY utils.R .
 
 # Create uploads directory
@@ -49,4 +49,4 @@ RUN mkdir -p /uploads
 EXPOSE 8004
 
 # Start Plumber API
-CMD ["R", "-e", "pr <- plumber::plumb('plumber.R'); pr$run(host='0.0.0.0', port=8004)"]
+CMD ["R", "-e", "pr <- plumber::plumb('plumber_reserved.R'); pr$run(host='0.0.0.0', port=8004)"]
