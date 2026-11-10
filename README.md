@@ -1,12 +1,36 @@
-# 📊 StatsMate - AI-Powered Statistical Analysis Platform
+# StatsMate: Regression Analysis for Non-Programmers
 
-> **CSC 230 Final Project** | Making regression analysis accessible for everyone
+StatsMate is a full-stack web app that lets social science students run regression analyses without writing code. Upload a CSV, choose an outcome and predictors, and get the coefficient table, diagnostic plots, a plain-language interpretation, and the R code to reproduce the analysis.
 
-StatsMate is a full-stack web application that enables political science students and social science researchers to perform regression analysis without coding expertise. Upload your data, select variables, and get AI-powered interpretations with professional visualizations.
+> Built by a six-person team for CSC 230 (Software Engineering) at the University of Tampa, Fall 2025. Originally hosted at [Dpatel0805693/Jakadd](https://github.com/Dpatel0805693/Jakadd). This copy is maintained by Jordano Liberato, who led the team.
 
-![StatsMate](https://img.shields.io/badge/Status-Production%20Ready-brightgreen)
-![Docker](https://img.shields.io/badge/Docker-Required-blue)
-![License](https://img.shields.io/badge/License-Educational-orange)
+**Demo:** _video coming soon_
+
+## My role
+
+Team lead and statistics lead. I designed and built:
+
+- **The R statistical services** (OLS and logistic regression via R/Plumber and broom), including diagnostics and reproducible R code generation
+- **The AI gateway**: OpenAI-backed variable-type detection, model suggestion and result interpretation, with response caching and a monthly cost cap
+- **The Docker setup** and the **integration test suites** for the R and AI services
+- Frontend technical direction for the analysis and results workflow
+
+Teammates built the core API and database (Khalil), orchestration (Amanda), the UI (Dhwani), visualizations (Anthony) and documentation (Darwin). See the [team table](#-development-team).
+
+## Engineering notes (2026 cleanup)
+
+After the course, I audited the code and fixed the issues a production review would catch:
+
+| Issue | Fix |
+|---|---|
+| User-supplied formulas and column names went straight into R's `as.formula()`, so a formula like `y ~ system("...")` could run code on the server | Formulas are built only from column names that exist in the data; formula strings may contain only basic operators (`r-services/utils.R`) |
+| The R services could read any file path sent to them | File reads are restricted to the uploads directory |
+| Logistic results were described as unit changes in the outcome, but logistic coefficients are log-odds | Interpretations now use odds ratios (with confidence intervals) and flag likely separation |
+| The AI gateway was built and tested but never called by the analysis pipeline | The pipeline now calls it, with a deterministic template as the fallback |
+| Queued jobs were removed from the queue but never run | Replaced with a concurrency limiter where queued requests wait and then run |
+| The CSV reader split lines on commas, breaking on quoted fields | Uses a real CSV parser |
+
+Unit tests for the orchestration layer: `cd integration-api && npm install && npm test`.
 
 ---
 
@@ -68,8 +92,8 @@ StatsMate is a full-stack web application that enables political science student
 ### Step 2: Clone the Repository
 
 ```bash
-git clone https://github.com/Dpatel0805693/Jakadd.git
-cd Jakadd
+git clone https://github.com/j-lib/statsmate.git
+cd statsmate
 ```
 
 ### Step 3: Create Environment File
@@ -160,7 +184,7 @@ Click **"Download Results"** to save your analysis.
 
 ## 📁 Sample Data
 
-Test datasets are available in the `examples/` folder.
+Test datasets are available in the `examples/` folder (`student_performance.csv`, `logistic_regression_sample.csv`, `voting_data.csv`, `survey.csv`). Note that the small logistic sample data is perfectly separable, so StatsMate will warn about separation.
 
 ### Example: OLS Analysis
 - **Dependent**: Any continuous variable (e.g., `final_grade`)
@@ -293,13 +317,20 @@ This is a statistical issue (complete separation). Try:
 │   │   └── services/           # API client
 │   └── Dockerfile
 ├── integration-api/            # Analysis orchestration
+│   ├── routes/analyzeRoute.js  # Pipeline: CSV → R service → interpretation
+│   ├── limiter.js              # Concurrency limit + wait queue
+│   ├── interpretation.js       # AI formatting + template fallback
+│   ├── test/                   # Unit tests (npm test)
 │   └── Dockerfile
 ├── ai-gateway/                 # AI service
 │   └── Dockerfile
 ├── r-services/                 # R statistical services
 │   ├── plumber_ols.R
 │   ├── plumber_logistic.R
+│   ├── utils.R                 # Data loading + formula validation
 │   └── Dockerfile.*
+├── docs/                       # Team dynamics and requirements document
+├── tests/                      # Integration tests for the R and AI services
 ├── examples/                   # Sample datasets
 ├── docker-compose.yml          # Container orchestration
 └── README.md
@@ -326,8 +357,8 @@ This is a statistical issue (complete separation). Try:
 
 1. Clone and start:
    ```bash
-   git clone https://github.com/Dpatel0805693/Jakadd.git
-   cd Jakadd
+   git clone https://github.com/j-lib/statsmate.git
+   cd statsmate
    docker-compose up --build
    ```
 
