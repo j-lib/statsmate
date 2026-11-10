@@ -1,337 +1,172 @@
-// routes/analyzeRoute.js - Main orchestration endpoint (ES Module version)
-// FIXED: Reads CSV and sends inline data to R services
+// routes/analyzeRoute.js - Main orchestration endpoint
+// Reads the uploaded CSV, runs the regression in the R service for the chosen
+// model, then asks the AI gateway for a plain-language interpretation (falling
+// back to a deterministic template if the gateway is unavailable).
 import express from 'express';
 import axios from 'axios';
 import fs from 'fs';
-import processPool from '../processPool.js';
-import queueManager from '../queueManager.js';
+import path from 'path';
+import { parse } from 'csv-parse/sync';
+import limiter, { QueueFullError } from '../limiter.js';
+import { templateInterpretation, aiInterpretationToMarkdown } from '../interpretation.js';
 
 const router = express.Router();
 
-// Service URLs from environment variables
 const AI_GATEWAY_URL = process.env.AI_GATEWAY_URL || 'http://ai-gateway:8001';
 const R_OLS_URL = process.env.R_OLS_URL || 'http://r-ols:8000';
 const R_LOGISTIC_URL = process.env.R_LOGISTIC_URL || 'http://r-logistic:8002';
+const UPLOADS_DIR = process.env.UPLOADS_DIR || '/uploads';
+const ANALYSIS_TIMEOUT = Number(process.env.ANALYSIS_TIMEOUT) || 45000;
+const AI_TIMEOUT = Number(process.env.AI_TIMEOUT) || 20000;
 
-// Parse CSV string to array of objects
-function parseCSV(csvString) {
-  const lines = csvString.trim().split('\n');
-  const headers = lines[0].split(',').map(h => h.trim().replace(/^"|"$/g, ''));
-  const result = [];
-  
-  for (let i = 1; i < lines.length; i++) {
-    if (!lines[i].trim()) continue;
-    const values = lines[i].split(',').map(v => v.trim().replace(/^"|"$/g, ''));
-    const row = {};
-    headers.forEach((header, idx) => {
-      const val = values[idx];
-      const num = parseFloat(val);
-      row[header] = isNaN(num) ? val : num;
-    });
-    result.push(row);
-  }
-  return result;
+// Parse CSV text into an array of row objects. Handles quoted fields
+// (including commas and newlines inside quotes) and converts numeric strings.
+export function parseCSV(csvString) {
+  return parse(csvString, {
+    columns: true,
+    skip_empty_lines: true,
+    trim: true,
+    bom: true,
+    cast: (value) => {
+      if (value === '') return null;
+      const num = Number(value);
+      return Number.isFinite(num) ? num : value;
+    },
+  });
 }
 
-// Main orchestration endpoint
+// Only files inside the uploads directory may be read
+function resolveUploadPath(dataPath) {
+  const filename = path.basename(String(dataPath));
+  const candidates = [path.join(UPLOADS_DIR, filename), path.join('./uploads', filename)];
+  return candidates.find((p) => fs.existsSync(p)) || null;
+}
+
+async function getInterpretation({ modelType, rData, dependentVar }) {
+  const context = {
+    modelType,
+    tidy: rData.tidy || [],
+    glance: rData.glance || {},
+    dependentVar,
+    successLevel: Array.isArray(rData.outcome_success_level) ? rData.outcome_success_level[0] : rData.outcome_success_level,
+    warning: Array.isArray(rData.warning) ? rData.warning[0] : rData.warning,
+  };
+
+  try {
+    const ai = await axios.post(
+      `${AI_GATEWAY_URL}/interpret`,
+      { model_type: modelType, formula: [].concat(rData.formula)[0], results: { tidy: context.tidy, glance: context.glance } },
+      { timeout: AI_TIMEOUT }
+    );
+    if (ai.data?.ok) {
+      return { text: aiInterpretationToMarkdown(ai.data, { warning: context.warning }), source: 'ai' };
+    }
+  } catch (error) {
+    const reason = error.response?.data?.error || error.code || error.message;
+    console.log(`   AI gateway unavailable (${reason}); using template interpretation`);
+  }
+  return { text: templateInterpretation(context), source: 'template' };
+}
+
 router.post('/analyze', async (req, res) => {
   const { userId, fileId, data_path, dependentVar, independentVars, modelType } = req.body;
 
-  // Validate inputs
-  if (!data_path || !dependentVar || !independentVars) {
-    return res.status(400).json({ 
+  if (!data_path || !dependentVar || !Array.isArray(independentVars) || independentVars.length === 0) {
+    return res.status(400).json({
       error: 'Missing required fields',
-      required: ['data_path', 'dependentVar', 'independentVars']
+      required: ['data_path', 'dependentVar', 'independentVars'],
     });
   }
 
   const jobId = `job-${Date.now()}-${userId || 'anonymous'}`;
-  console.log(`\n${'='.repeat(60)}`);
-  console.log(`🔄 New analysis request: ${jobId}`);
-  console.log(`   Dependent: ${dependentVar}`);
-  console.log(`   Independent: ${independentVars.join(', ')}`);
-  console.log(`   Data path: ${data_path}`);
-
+  const model = modelType === 'logistic' ? 'logistic' : 'ols'; // 'auto' defaults to OLS
   const startTime = Date.now();
+  console.log(`🔄 ${jobId}: ${model} ${dependentVar} ~ ${independentVars.join(' + ')}`);
 
   try {
-    // Determine model type
-    let suggestedModel = modelType || 'ols';
-    if (suggestedModel === 'auto') {
-      suggestedModel = 'ols'; // Default to OLS
-    }
-    console.log(`   Model type: ${suggestedModel}`);
-
-    // Check for available process
-    const availableProcess = processPool.getAvailableProcess();
-
-    if (!availableProcess) {
-      try {
-        const position = queueManager.enqueue({
-          id: jobId,
-          userId: userId || 'anonymous',
-          fileId,
-          data_path,
-          dependentVar,
-          independentVars,
-          modelType: suggestedModel
-        });
-
-        console.log(`⏸️  All processes busy - job queued at position ${position}`);
-
-        return res.status(202).json({
-          status: 'queued',
-          jobId,
-          position,
-          message: `Analysis queued. Position ${position}`,
-          estimatedWait: `${position * 10} seconds`
-        });
-      } catch (error) {
-        console.log(`❌ Queue full - rejecting request`);
-        return res.status(429).json({
-          error: 'Queue full',
-          message: 'Too many requests. Please try again in 10 seconds.',
-          retryAfter: 10
-        });
+    const result = await limiter.run(jobId, async () => {
+      const filePath = resolveUploadPath(data_path);
+      if (!filePath) {
+        const err = new Error(`Cannot find file: ${path.basename(String(data_path))}`);
+        err.status = 400;
+        err.code = 'FILE_NOT_FOUND';
+        throw err;
       }
-    }
 
-    // Mark process as busy
-    processPool.markBusy(availableProcess.port, jobId);
+      const inlineData = parseCSV(fs.readFileSync(filePath, 'utf8'));
+      const serviceUrl = model === 'logistic' ? R_LOGISTIC_URL : R_OLS_URL;
 
-    // READ THE CSV FILE AND PARSE IT
-    console.log(`   📂 Reading file...`);
-    const possiblePaths = [
-      data_path,
-      data_path.replace('/app/uploads', '/uploads'),
-      `/uploads/${data_path.split('/').pop()}`,
-      `./uploads/${data_path.split('/').pop()}`
-    ];
-    
-    let csvContent = null;
-    let usedPath = null;
-    
-    for (const tryPath of possiblePaths) {
-      try {
-        if (fs.existsSync(tryPath)) {
-          csvContent = fs.readFileSync(tryPath, 'utf8');
-          usedPath = tryPath;
-          console.log(`   ✓ Found file at: ${tryPath}`);
-          break;
-        }
-      } catch (e) {
-        // Continue trying
-      }
-    }
+      const rResponse = await axios.post(
+        `${serviceUrl}/${model}`,
+        { data: inlineData, dependent_var: dependentVar, independent_vars: independentVars },
+        { timeout: ANALYSIS_TIMEOUT }
+      );
+      const rData = rResponse.data;
+      if (rData.error) throw new Error(`${rData.error}${rData.message ? ': ' + rData.message : ''}`);
 
-    if (!csvContent) {
-      console.log(`   ❌ File not found at any path`);
-      processPool.markAvailable(availableProcess.port);
-      return res.status(400).json({ 
-        error: 'FILE_NOT_FOUND',
-        message: `Cannot find file: ${data_path}`,
-        triedPaths: possiblePaths
-      });
-    }
+      const interpretation = await getInterpretation({ modelType: model, rData, dependentVar });
+      return { rData, interpretation, serviceUrl };
+    });
 
-    // Parse CSV to JSON
-    const inlineData = parseCSV(csvContent);
-    console.log(`   ✓ Parsed ${inlineData.length} rows`);
+    const { rData, interpretation, serviceUrl } = result;
+    const processingTime = Number(((Date.now() - startTime) / 1000).toFixed(2));
+    console.log(`✅ ${jobId} complete in ${processingTime}s (interpretation: ${interpretation.source})`);
 
-    // Determine R service URL and endpoint
-    let rServiceUrl;
-    let rEndpoint;
-    
-    if (suggestedModel === 'logistic') {
-      rServiceUrl = R_LOGISTIC_URL;
-      rEndpoint = 'logistic';
-      console.log(`   ✓ Routing to LOGISTIC service: ${rServiceUrl}`);
-    } else {
-      rServiceUrl = R_OLS_URL;
-      rEndpoint = 'ols';
-      console.log(`   ✓ Routing to OLS service: ${rServiceUrl}`);
-    }
-    
-    // Call R service with INLINE DATA
-    console.log(`   [1/2] Running ${suggestedModel} regression...`);
-    
-    const rResponse = await axios.post(
-      `${rServiceUrl}/${rEndpoint}`, 
-      {
-        data: inlineData,  // Send data inline!
-        dependent_var: dependentVar,
-        independent_vars: independentVars
-      }, 
-      { timeout: 45000 }
-    );
-
-    console.log(`   ✓ R service response received`);
-
-    // Check for R-side errors
-    if (rResponse.data.error) {
-      throw new Error(rResponse.data.error + ': ' + (rResponse.data.message || ''));
-    }
-
-    const rData = rResponse.data;
-
-    // Results are already in tidy format from broom
-    const tidy = rData.tidy || [];
-    const glance = rData.glance || {};
-    const diagnostics = rData.diagnostics || null;
-    const r_code = rData.r_code || '';
-
-    // Generate interpretation
-    console.log(`   [2/2] Generating interpretation...`);
-    const interpretation = generateInterpretation(suggestedModel, tidy, glance, dependentVar, independentVars);
-
-    const processingTime = ((Date.now() - startTime) / 1000).toFixed(2);
-    console.log(`✅ Analysis complete in ${processingTime}s`);
-    console.log(`${'='.repeat(60)}\n`);
-
-    // Mark process as available
-    processPool.markAvailable(availableProcess.port);
-
-    // Process next queued job if any
-    if (queueManager.getSize() > 0) {
-      const nextJob = queueManager.dequeue();
-      console.log(`🔄 Processing next queued job: ${nextJob.id}`);
-    }
-
-    // Return combined results
     return res.status(200).json({
       status: 'complete',
       jobId,
-      modelType: suggestedModel,
+      modelType: model,
       results: {
-        tidy: tidy,
-        glance: glance,
-        diagnostics: diagnostics,
-        r_code: r_code
+        tidy: rData.tidy || [],
+        glance: rData.glance || {},
+        diagnostics: rData.diagnostics || null,
+        r_code: rData.r_code || '',
+        warning: rData.warning || null,
       },
-      interpretation,
-      processingTime: parseFloat(processingTime),
-      rService: rServiceUrl
+      interpretation: interpretation.text,
+      interpretationSource: interpretation.source,
+      processingTime,
+      rService: serviceUrl,
     });
-
   } catch (error) {
-    // Mark process as available on error
-    try {
-      processPool.markAvailable(8000);
-      processPool.markAvailable(8002);
-    } catch (e) {}
-
     const processingTime = ((Date.now() - startTime) / 1000).toFixed(2);
-    console.error(`❌ Analysis failed after ${processingTime}s:`, error.message);
-    if (error.response?.data) {
-      console.error(`   R response:`, JSON.stringify(error.response.data));
-    }
+    console.error(`❌ ${jobId} failed after ${processingTime}s:`, error.message);
 
+    if (error instanceof QueueFullError) {
+      return res.status(429).json({ error: 'Queue full', message: 'Too many requests. Please try again shortly.', retryAfter: 10 });
+    }
+    if (error.code === 'FILE_NOT_FOUND') {
+      return res.status(400).json({ error: 'FILE_NOT_FOUND', message: error.message });
+    }
     if (error.code === 'ECONNREFUSED') {
-      return res.status(503).json({
-        error: 'Service unavailable',
-        message: 'Cannot connect to R analysis service.',
-        service: error.config?.url
-      });
+      return res.status(503).json({ error: 'Service unavailable', message: 'Cannot connect to the R analysis service.' });
     }
-
     if (error.code === 'ETIMEDOUT' || error.code === 'ECONNABORTED') {
-      return res.status(504).json({
-        error: 'Analysis timeout',
-        message: 'Analysis took too long. Try with a smaller dataset.',
-        processingTime: `${processingTime}s`
-      });
+      return res.status(504).json({ error: 'Analysis timeout', message: 'Analysis took too long. Try a smaller dataset.' });
     }
-
     if (error.response) {
       return res.status(error.response.status || 500).json({
         error: 'Analysis error',
-        message: error.response.data?.error || error.response.data?.message || 'Analysis failed',
-        details: error.response.data
+        message: [].concat(error.response.data?.error || error.response.data?.message || 'Analysis failed')[0],
+        details: error.response.data,
       });
     }
-
-    return res.status(500).json({
-      error: 'Analysis failed',
-      message: error.message,
-      jobId
-    });
+    return res.status(500).json({ error: 'Analysis failed', message: error.message, jobId });
   }
 });
 
-// Generate plain-language interpretation
-function generateInterpretation(modelType, tidy, glance, dependentVar, independentVars) {
-  let text = `## ${modelType.toUpperCase()} Regression Results\n\n`;
-  
-  // Model fit for OLS
-  const rSquared = glance['r.squared'] || glance.r_squared;
-  if (modelType === 'ols' && rSquared !== undefined) {
-    const rSquaredPercent = (rSquared * 100).toFixed(1);
-    text += `**Model Fit:** This model explains **${rSquaredPercent}%** of the variance in ${dependentVar}. `;
-    
-    if (rSquared > 0.7) {
-      text += `This is considered a strong fit.\n\n`;
-    } else if (rSquared > 0.4) {
-      text += `This is a moderate fit.\n\n`;
-    } else {
-      text += `This is a weak fit - other factors may be important.\n\n`;
-    }
-  } else if (modelType === 'logistic' && glance.AIC) {
-    text += `**Model Fit:** AIC = ${glance.AIC.toFixed(2)}\n\n`;
-  }
-
-  // Coefficients interpretation
-  if (tidy && tidy.length > 0) {
-    text += `**Key Findings:**\n\n`;
-    
-    tidy.forEach(row => {
-      const term = row.term;
-      const estimate = row.estimate;
-      const pValue = row['p.value'] || row.p_value;
-      
-      if (term === '(Intercept)') {
-        text += `- **Intercept**: ${estimate?.toFixed(4) || 'N/A'} (baseline value)\n\n`;
-      } else {
-        const isSignificant = pValue !== null && pValue !== undefined && pValue < 0.05;
-        const effect = estimate > 0 ? 'increases' : 'decreases';
-        const absEffect = Math.abs(estimate || 0).toFixed(4);
-        
-        text += `- **${term}**: `;
-        if (isSignificant) {
-          text += `For every 1-unit increase, ${dependentVar} ${effect} by ${absEffect} (p = ${pValue?.toFixed(4) || 'N/A'}, statistically significant ✓)\n\n`;
-        } else {
-          text += `Effect of ${absEffect} (p = ${pValue?.toFixed(4) || 'N/A'}, not statistically significant)\n\n`;
-        }
-      }
-    });
-  }
-
-  return text;
-}
-
-// Health check
 router.get('/health', (req, res) => {
-  const poolStatus = processPool.getStatus();
-  const queueStatus = queueManager.getStatus();
-
   res.json({
     status: 'healthy',
     service: 'integration-api',
-    processPool: poolStatus,
-    queue: queueStatus,
-    services: {
-      rOls: R_OLS_URL,
-      rLogistic: R_LOGISTIC_URL
-    },
-    timestamp: new Date().toISOString()
+    limiter: limiter.getStatus(),
+    services: { rOls: R_OLS_URL, rLogistic: R_LOGISTIC_URL, aiGateway: AI_GATEWAY_URL },
+    timestamp: new Date().toISOString(),
   });
 });
 
-// Queue status
 router.get('/queue-status', (req, res) => {
-  res.json({
-    queue: queueManager.getStatus(),
-    processPool: processPool.getStatus()
-  });
+  res.json({ limiter: limiter.getStatus() });
 });
 
 export default router;

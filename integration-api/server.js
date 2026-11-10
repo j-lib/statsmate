@@ -31,8 +31,7 @@ app.get("/", (req, res) => {
     endpoints: {
       analyze: "POST /integrate/analyze",
       health: "GET /integrate/health",
-      queueStatus: "GET /integrate/queue-status",
-      clearQueue: "POST /integrate/queue/clear"
+      queueStatus: "GET /integrate/queue-status"
     }
   });
 });
@@ -58,8 +57,7 @@ app.use((err, req, res, next) => {
 // Start server
 app.listen(PORT, () => {
   console.log(`\n Integration API running on port ${PORT}`);
-  console.log(` Process pool initialized with 3 R instances`);
-  console.log(` Queue capacity: 10 requests`);
+  console.log(` Concurrency limit: ${process.env.MAX_CONCURRENT_ANALYSES || 3}; queue capacity: ${process.env.MAX_QUEUE_SIZE || 10}`);
   console.log(` Ready to orchestrate statistical analyses!\n`);
 });
 

@@ -1,9 +1,9 @@
 # plumber_ols.R - OLS Regression Service
 # Port: 8000
-# FIXED: Accepts inline data parameter
 library(plumber)
 library(broom)
 library(jsonlite)
+source("utils.R")
 
 #* @apiTitle OLS Regression Service
 #* @apiDescription Performs Ordinary Least Squares regression analysis
@@ -14,22 +14,21 @@ function(req, res) {
   res$setHeader("Access-Control-Allow-Origin", "*")
   res$setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
   res$setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization")
-  
+
   if (req$REQUEST_METHOD == "OPTIONS") {
     res$status <- 200
     return(list())
   }
-  
+
   plumber::forward()
 }
 
 # ---------------- Helper to parse body ----------------
 parse_body <- function(req) {
-  body <- tryCatch(
+  tryCatch(
     jsonlite::fromJSON(req$postBody, simplifyVector = FALSE),
     error = function(e) NULL
   )
-  return(body)
 }
 
 # ---------------- Endpoints ----------------
@@ -49,112 +48,44 @@ function() {
 #* @post /ols
 function(req, res) {
   tryCatch({
-    # Parse JSON body
     body <- parse_body(req)
-    
     if (is.null(body)) {
       res$status <- 400
       return(list(error = "Invalid JSON body"))
     }
-    
-    # Get parameters
-    inline_data <- body$data
-    data_path <- body$data_path
-    dependent_var <- body$dependent_var
-    independent_vars <- body$independent_vars
-    formula_str <- body$formula
-    
-    # Load data - prefer inline data over file path
-    data <- NULL
-    
-    if (!is.null(inline_data) && length(inline_data) > 0) {
-      # Convert inline JSON data to data frame
-      data <- tryCatch({
-        df <- do.call(rbind, lapply(inline_data, function(row) {
-          as.data.frame(row, stringsAsFactors = FALSE)
-        }))
-        # Ensure numeric columns are numeric
-        for (col in names(df)) {
-          if (is.character(df[[col]])) {
-            numeric_vals <- suppressWarnings(as.numeric(df[[col]]))
-            if (!all(is.na(numeric_vals))) {
-              df[[col]] <- numeric_vals
-            }
-          }
-        }
-        df
-      }, error = function(e) {
-        message("Error parsing inline data: ", e$message)
-        NULL
-      })
-    } else if (!is.null(data_path)) {
-      # Try to load from file
-      data <- tryCatch({
-        if (grepl("\\.csv$", data_path, ignore.case = TRUE)) {
-          read.csv(data_path, stringsAsFactors = FALSE)
-        } else if (grepl("\\.xlsx?$", data_path, ignore.case = TRUE)) {
-          if (requireNamespace("readxl", quietly = TRUE)) {
-            readxl::read_excel(data_path)
-          } else {
-            stop("readxl package not available")
-          }
-        } else {
-          stop("Unsupported file format")
-        }
-      }, error = function(e) {
-        message("Error loading file: ", e$message)
-        NULL
-      })
-    }
-    
-    if (is.null(data) || nrow(data) == 0) {
+
+    # Load data (inline rows, or a file inside the uploads directory)
+    data <- tryCatch(load_data(body[["data"]], body[["data_path"]]), error = function(e) e)
+    if (inherits(data, "error")) {
       res$status <- 400
-      return(list(error = "No data provided or data could not be loaded"))
+      return(list(error = conditionMessage(data)))
     }
-    
-    # Build formula
-    if (!is.null(formula_str)) {
-      # Use provided formula string
-      model_formula <- as.formula(formula_str)
-    } else if (!is.null(dependent_var) && !is.null(independent_vars)) {
-      # Build formula from dependent/independent vars
-      if (is.list(independent_vars)) {
-        independent_vars <- unlist(independent_vars)
-      }
-      formula_str <- paste(dependent_var, "~", paste(independent_vars, collapse = " + "))
-      model_formula <- as.formula(formula_str)
-    } else {
+    if (nrow(data) == 0) {
       res$status <- 400
-      return(list(error = "Provide either 'formula' or 'dependent_var' + 'independent_vars'"))
+      return(list(error = "The data has no rows"))
     }
-    
-    # Verify columns exist
-    formula_vars <- all.vars(model_formula)
-    missing_vars <- setdiff(formula_vars, names(data))
-    if (length(missing_vars) > 0) {
+
+    # Build a validated formula (never evaluates user-supplied code)
+    model_formula <- tryCatch(resolve_formula(body, data), error = function(e) e)
+    if (inherits(model_formula, "error")) {
       res$status <- 400
-      return(list(
-        error = "Variables not found in data",
-        missing = missing_vars,
-        available = names(data)
-      ))
+      return(list(error = conditionMessage(model_formula), available = names(data)))
     }
-    
-    # Fit OLS model
+    formula_str <- formula_text(model_formula)
+
+    # Fit OLS model (rows with missing values in model variables are dropped)
     model <- lm(model_formula, data = data)
-    
-    # Extract tidy results using broom
+
     tidy_results <- tidy(model, conf.int = TRUE)
     glance_results <- glance(model)
-    
-    # Add diagnostics
+
     diagnostics <- list(
       residuals = as.numeric(residuals(model)),
       fitted = as.numeric(fitted(model)),
       standardized_residuals = as.numeric(rstandard(model))
     )
-    
-    # Generate R code for reproducibility
+
+    # R code the student can run to reproduce the analysis
     r_code <- paste0(
       "# OLS Regression Analysis\n",
       "# Generated by StatsMate\n\n",
@@ -169,26 +100,21 @@ function(req, res) {
       "glance(model)\n",
       "confint(model)\n"
     )
-    
-    # Return results
+
     list(
       status = "success",
       model_type = "ols",
       formula = formula_str,
-      n_obs = nrow(data),
+      n_obs = stats::nobs(model),
       tidy = tidy_results,
       glance = glance_results,
       diagnostics = diagnostics,
       r_code = r_code,
       timestamp = format(Sys.time(), "%Y-%m-%d %H:%M:%S")
     )
-    
   }, error = function(e) {
     res$status <- 500
-    list(
-      error = "Analysis failed",
-      message = as.character(e$message)
-    )
+    list(error = "Analysis failed", message = as.character(conditionMessage(e)))
   })
 }
 
